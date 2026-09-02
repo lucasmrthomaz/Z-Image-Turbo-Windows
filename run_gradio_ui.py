@@ -7,9 +7,12 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+import gc
+
 import gradio as gr
 from gradio import Brush, Eraser
-from PIL import Image, ImageOps
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+
 
 
 ROOT = Path(__file__).parent
@@ -407,9 +410,11 @@ def run_generation_job(job):
             job["vram_mode"],
             job["clip_on_cpu"],
             job["balanced_vae_tiling"],
+            job.get("cpu_threads", -1),
+            job.get("enable_dit_cache", True),
             active_negative_prompt,
             active_guidance,
-            generation_mode != "txt2img",
+            generation_mode == "img2img",
             active_init_image,
             active_strength,
             active_mask,
@@ -429,6 +434,7 @@ def run_generation_job(job):
     except Exception as exc:
         update_job_status(job["id"], "failed")
         set_latest_state(status=f"Generation failed unexpectedly: {exc}")
+        gc.collect()
         return
 
     if stop_requested or "Generation stopped" in last_log:
@@ -446,6 +452,8 @@ def run_generation_job(job):
         time_text=f"Generation Time: **{last_time}**",
         command=last_command,
     )
+    gc.collect()
+
 
 
 def queue_worker():
@@ -477,8 +485,12 @@ def append_lora_tags(prompt, selected_loras, lora_strength):
     return final_prompt
 
 
-def low_vram_flags(vram_mode, clip_on_cpu, balanced_vae_tiling):
+def low_vram_flags(vram_mode, clip_on_cpu, balanced_vae_tiling, cpu_threads=-1, enable_dit_cache=True):
     flags = []
+    if cpu_threads and int(cpu_threads) > 0:
+        flags.extend(["-t", str(cpu_threads)])
+    if enable_dit_cache:
+        flags.extend(["--cache-mode", "easycache", "--cache-option", "threshold=0.25"])
     if vram_mode == "4GB (safest)":
         flags.extend(["--offload-to-cpu", "--diffusion-fa", "--vae-tiling", "--vae-conv-direct"])
         if clip_on_cpu:
@@ -490,6 +502,31 @@ def low_vram_flags(vram_mode, clip_on_cpu, balanced_vae_tiling):
     elif vram_mode == "10GB+ (fastest)":
         flags.append("--diffusion-fa")
     return flags
+
+
+
+def upscale_image(image_path, scale_factor=2.0):
+    """Upscale image using Lanczos resampling with adaptive unsharp mask sharpening."""
+    if not image_path or not os.path.exists(image_path):
+        return None, "No image selected for upscaling."
+    try:
+        with Image.open(image_path) as img:
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            w, h = img.size
+            new_w, new_h = int(w * float(scale_factor)), int(h * float(scale_factor))
+
+            upscaled = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            upscaled = upscaled.filter(ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=3))
+
+            uid = uuid.uuid4().hex[:8]
+            out_file = str((OUTDIR / f"upscaled_{new_w}x{new_h}_{uid}.png").absolute())
+            upscaled.save(out_file, quality=95)
+
+            gc.collect()
+            return out_file, f"Successfully upscaled image to {new_w}x{new_h}!"
+    except Exception as exc:
+        return None, f"Error upscaling image: {exc}"
+
 
 
 def prepare_init_image(init_image_path, width, height):
@@ -575,6 +612,65 @@ def write_metadata(out_file, metadata):
         print(f"Could not write metadata file: {exc}")
 
 
+def ensure_model_file(model_key):
+    import json
+    import requests
+    from tqdm import tqdm
+
+    registry_path = ROOT / "config" / "model_registry.json"
+    if not registry_path.exists():
+        return None
+    try:
+        data = json.loads(registry_path.read_text(encoding="utf-8"))
+        model_info = data.get("models", {}).get(model_key)
+        if not model_info:
+            return None
+
+        m_type = model_info.get("type", "")
+        if m_type == "vae":
+            dest_dir = ROOT / "models" / "vae"
+        elif m_type in ("llm", "t5"):
+            dest_dir = ROOT / "models" / "llm"
+        else:
+            dest_dir = ROOT / "models" / "zimage"
+
+        dest_file = dest_dir / model_info["filename"]
+        if dest_file.exists() and dest_file.stat().st_size > 50 * 1024 * 1024:
+            return str(dest_file.absolute())
+
+        url = model_info.get("url")
+        if not url:
+            return None
+
+        print(f"Downloading missing model {model_info['display_name']} from HuggingFace...")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        response = requests.get(url, stream=True, allow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
+        response.raise_for_status()
+        total_size = int(response.headers.get("content-length", 0))
+
+        temp_file = dest_file.with_suffix(".tmp")
+        with open(temp_file, "wb") as f, tqdm(
+            desc=model_info["filename"],
+            total=total_size,
+            unit="iB",
+            unit_scale=True,
+            unit_divisor=1024,
+        ) as bar:
+            for data_chunk in response.iter_content(chunk_size=1024 * 1024):
+                if data_chunk:
+                    size = f.write(data_chunk)
+                    bar.update(size)
+        if temp_file.exists():
+            if dest_file.exists():
+                dest_file.unlink()
+            temp_file.rename(dest_file)
+        return str(dest_file.absolute())
+    except Exception as exc:
+        print(f"Auto-download model failed: {exc}")
+        return None
+
+
 def gen_image(
     prompt,
     width,
@@ -590,6 +686,8 @@ def gen_image(
     vram_mode,
     clip_on_cpu,
     balanced_vae_tiling,
+    cpu_threads,
+    enable_dit_cache,
     negative_prompt,
     guidance,
     img2img_enabled,
@@ -621,42 +719,45 @@ def gen_image(
 
     uid = uuid.uuid4().hex[:8]
     out_file = str((OUTDIR / f"out_{uid}.png").absolute())
+    diffusion_model = MODEL_PATH
+
     final_prompt = append_lora_tags(prompt, selected_loras, lora_strength)
 
     cmd = [
-        SD_EXE,
-        "--diffusion-model",
-        MODEL_PATH,
-        "--vae",
-        vae_path,
-        "--llm",
-        llm_path,
-        "--lora-model-dir",
-        str(LORA_DIR),
-        "--lora-apply-mode",
-        lora_apply_mode,
-        "-p",
-        final_prompt,
-        "--guidance",
-        str(guidance),
-        "--cfg-scale",
-        str(cfg_scale),
-        "--steps",
-        str(steps),
-        "-H",
-        str(height),
-        "-W",
-        str(width),
-        "-o",
-        out_file,
-        "--seed",
-        str(seed),
-        "--rng",
-        "cuda",
-    ]
+            SD_EXE,
+            "--diffusion-model",
+            diffusion_model,
+            "--vae",
+            vae_path,
+            "--llm",
+            llm_path,
+            "--lora-model-dir",
+            str(LORA_DIR),
+            "--lora-apply-mode",
+            lora_apply_mode,
+            "-p",
+            final_prompt,
+            "--guidance",
+            str(guidance),
+            "--cfg-scale",
+            str(cfg_scale),
+            "--steps",
+            str(steps),
+            "-H",
+            str(height),
+            "-W",
+            str(width),
+            "-o",
+            out_file,
+            "--seed",
+            str(seed),
+            "--rng",
+            "cuda",
+        ]
+
     if negative_prompt:
         cmd.extend(["--negative-prompt", negative_prompt])
-    cmd.extend(low_vram_flags(vram_mode, clip_on_cpu, balanced_vae_tiling))
+    cmd.extend(low_vram_flags(vram_mode, clip_on_cpu, balanced_vae_tiling, cpu_threads, enable_dit_cache))
 
     if uses_input_image:
         cmd.extend(["--init-img", init_file, "--strength", str(img2img_strength)])
@@ -704,12 +805,14 @@ def gen_image(
                 total_time,
                 cmd_str,
             )
+        gc.collect()
         return
 
     if not os.path.exists(out_file):
         imgs = sorted(OUTDIR.glob("*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
         if not imgs:
             yield None, f"No image was produced.\n\n{full_log.strip()}", total_time, cmd_str
+            gc.collect()
             return
         out_file = str(imgs[0].absolute())
 
@@ -738,400 +841,296 @@ def gen_image(
             "log": full_log.strip(),
         },
     )
+    gc.collect()
     yield out_file, full_log.strip(), total_time, cmd_str
 
 
-with gr.Blocks() as demo:
-    gr.Markdown("# Z-Image Turbo - Low VRAM UI")
+
+CUSTOM_CSS = """
+.gradio-container { max-width: 100% !important; padding: 4px !important; }
+.compact-row { gap: 6px !important; margin-bottom: 2px !important; }
+.compact-group { padding: 6px !important; margin-bottom: 4px !important; border-radius: 6px; }
+button { font-weight: 600 !important; }
+"""
+
+with gr.Blocks(css=CUSTOM_CSS, title="Z-Image Turbo Dashboard") as demo:
+    gr.Markdown("# ⚡ Z-Image Turbo — Extreme Performance Dashboard")
     queue_refresh_timer = gr.Timer(1.0)
 
     with gr.Row():
-        with gr.Column(scale=3):
-            with gr.Tabs():
-                with gr.Tab("Basic"):
-                    txt2img_prompt = gr.Textbox(
-                        label="Text-to-image prompt",
-                        value="A large orange octopus on an ocean floor, cinematic, 8k",
-                        lines=3,
-                    )
-                    with gr.Row():
-                        txt2img_example = gr.Dropdown(
-                            list(TXT2IMG_PROMPTS.keys()),
-                            value="Portrait",
-                            label="Example Prompt",
-                        )
-                        txt2img_example_btn = gr.Button("Use Example", variant="secondary")
+        # LEFT COLUMN (Controls & Inputs)
+        with gr.Column(scale=5):
+            gen_mode = gr.Radio(
+                ["Text-to-Image", "Image-to-Image", "Inpaint"],
+                value="Text-to-Image",
+                label="Modo de Geração",
+                interactive=True,
+            )
 
-                    with gr.Row():
-                        preset = gr.Dropdown(
-                            [n for n, _, _ in RES_PRESETS],
-                            value="1:1 (512x512)",
-                            label="Resolution Preset",
-                        )
-                        steps = gr.Slider(1, 50, value=8, step=1, label="Steps")
-
-                    with gr.Row():
-                        width = gr.Dropdown(SIZE_OPTIONS, value=512, label="Width")
-                        height = gr.Dropdown(SIZE_OPTIONS, value=512, label="Height")
-
-                    with gr.Row():
-                        cfg_scale = gr.Slider(0.0, 10.0, value=1.0, step=0.1, label="CFG Scale")
-                        seed = gr.Number(value=-1, precision=0, label="Seed (-1 = random)")
-
-                    with gr.Row():
-                        random_seed_btn = gr.Button("Random Seed", variant="secondary")
-                        reuse_seed_btn = gr.Button("Reuse Last Seed", variant="secondary")
-
-                    with gr.Group():
-                        gr.Markdown("### Low VRAM Mode")
-                        vram_mode = gr.Radio(
-                            VRAM_PRESETS,
-                            value="4GB (safest)",
-                            label="VRAM Preset",
-                        )
-                        with gr.Row():
-                            clip_on_cpu = gr.Checkbox(
-                                value=False,
-                                label="4GB extra: keep text encoder on CPU",
-                            )
-                            balanced_vae_tiling = gr.Checkbox(
-                                value=False,
-                                label="6-8GB extra: VAE tiling",
-                            )
-
-                    with gr.Group():
-                        gr.Markdown("### LoRA Support")
-                        with gr.Row():
-                            lora_list = gr.CheckboxGroup(choices=get_lora_list(), label="Select LoRAs")
-                            refresh_btn = gr.Button("Refresh", variant="secondary", size="sm")
-                        with gr.Row():
-                            lora_strength = gr.Slider(0.0, 2.0, value=1.0, step=0.1, label="LoRA Strength")
-                            lora_apply_mode = gr.Dropdown(
-                                LORA_APPLY_MODES,
-                                value="auto",
-                                label="LoRA Apply Mode",
-                            )
-
-                with gr.Tab("Experimental Img2Img"):
-                    gr.Markdown(
-                        "Creates a variation of the uploaded image. Higher strength values produce larger changes."
-                    )
-                    gr.Markdown(
-                        "Experimental for Z-Image Turbo GGUF; results depend on backend support."
-                    )
-                    img2img_prompt = gr.Textbox(
-                        label="Img2Img prompt",
-                        value="Transform this image while preserving the main composition",
-                        lines=3,
-                    )
-                    with gr.Row():
-                        img2img_example = gr.Dropdown(
-                            list(IMG2IMG_PROMPTS.keys()),
-                            value="Color edit",
-                            label="Example Prompt",
-                        )
-                        img2img_example_btn = gr.Button("Use Example", variant="secondary")
-                    img2img_negative_prompt = gr.Textbox(
-                        label="Img2Img negative prompt",
-                        value="",
-                        lines=2,
-                    )
-                    img2img_enabled = gr.Checkbox(value=False, label="Enable img2img")
-                    init_image = gr.Image(
-                        label="Input image",
-                        type="filepath",
-                        interactive=False,
-                    )
-                    with gr.Group():
-                        gr.Markdown("### Img2Img Output Size")
-                        img2img_auto_size = gr.Checkbox(
-                            value=True,
-                            label="Auto match uploaded image aspect ratio",
-                        )
-                        img2img_preset = gr.Dropdown(
-                            [n for n, _, _ in RES_PRESETS],
-                            value="1:1 (512x512)",
-                            label="Img2Img Resolution Preset",
-                        )
-                        with gr.Row():
-                            img2img_width = gr.Dropdown(SIZE_OPTIONS, value=512, label="Img2Img Width")
-                            img2img_height = gr.Dropdown(SIZE_OPTIONS, value=512, label="Img2Img Height")
-                    with gr.Row():
-                        img2img_seed = gr.Number(value=-1, precision=0, label="Img2Img Seed (-1 = random)")
-                    with gr.Row():
-                        img2img_random_seed_btn = gr.Button("Random Img2Img Seed", variant="secondary")
-                        img2img_reuse_seed_btn = gr.Button("Reuse Last Img2Img Seed", variant="secondary")
-                    with gr.Row():
-                        img2img_steps = gr.Slider(
-                            4,
-                            30,
-                            value=12,
-                            step=1,
-                            label="Img2Img Steps",
-                            info="More steps give the prompt more chances to affect the uploaded image.",
-                        )
-                        img2img_guidance = gr.Slider(
-                            1.0,
-                            8.0,
-                            value=3.5,
-                            step=0.1,
-                            label="Img2Img Guidance",
-                            info="Higher values follow the prompt more strongly, but can create more drift.",
-                        )
-                    img2img_strength = gr.Slider(
-                        0.1,
-                        1.0,
-                        value=0.55,
-                        step=0.05,
-                        label="Img2Img Strength",
-                        info="Lower preserves more. Higher changes more. Z-Image usually needs about 0.50-0.60 for visible edits.",
-                        interactive=False,
-                    )
-
-                with gr.Tab("Inpaint / Selective Edit"):
-                    gr.Markdown(
-                        "Edit only selected regions while preserving the rest of the image. Experimental with Z-Image Turbo."
-                    )
-                    inpaint_enabled = gr.Checkbox(value=False, label="Enable inpainting")
-                    inpaint_editor = gr.ImageEditor(
-                        label="Source image and mask",
-                        type="pil",
-                        image_mode="RGBA",
-                        brush=Brush(default_size=32, colors=["#ffffff"], default_color="#ffffff", color_mode="fixed"),
-                        eraser=Eraser(default_size=32),
-                        layers=True,
-                        interactive=False,
-                        height=420,
-                    )
-                    inpaint_prompt = gr.Textbox(
-                        label="Inpaint prompt",
-                        value="Replace the masked area while matching the original lighting and style",
-                        lines=3,
-                    )
-                    with gr.Row():
-                        inpaint_example = gr.Dropdown(
-                            list(INPAINT_PROMPTS.keys()),
-                            value="Replace object",
-                            label="Example Prompt",
-                        )
-                        inpaint_example_btn = gr.Button("Use Example", variant="secondary")
-                    inpaint_negative_prompt = gr.Textbox(
-                        label="Inpaint negative prompt",
-                        value="",
-                        lines=2,
-                    )
-                    with gr.Row():
-                        inpaint_seed = gr.Number(value=-1, precision=0, label="Inpaint Seed (-1 = random)")
-                    with gr.Row():
-                        inpaint_random_seed_btn = gr.Button("Random Inpaint Seed", variant="secondary")
-                        inpaint_reuse_seed_btn = gr.Button("Reuse Last Inpaint Seed", variant="secondary")
-                    with gr.Row():
-                        inpaint_steps = gr.Slider(4, 30, value=12, step=1, label="Inpaint Steps")
-                        inpaint_guidance = gr.Slider(1.0, 8.0, value=4.0, step=0.1, label="Inpaint Guidance")
-                    inpaint_strength = gr.Slider(
-                        0.1,
-                        1.0,
-                        value=0.75,
-                        step=0.05,
-                        label="Inpaint Strength",
-                        info="Higher values make the masked area change more.",
-                        interactive=False,
-                    )
-
-                with gr.Tab("Advanced"):
-                    unlock = gr.Checkbox(value=False, label="Allow editing advanced paths")
-                    with gr.Row():
-                        vae_path = gr.Textbox(label="VAE path", value=DEFAULT_VAE_PATH, interactive=False)
-                        llm_path = gr.Textbox(label="LLM (Qwen) path", value=DEFAULT_LLM_PATH, interactive=False)
+            prompt = gr.Textbox(
+                label="Prompt",
+                value="A large orange octopus on an ocean floor, cinematic, 8k",
+                lines=2,
+                placeholder="Descreva a imagem que deseja gerar...",
+            )
 
             with gr.Row():
-                btn = gr.Button("Generate", variant="primary", scale=2)
-                stop_btn = gr.Button("Stop", variant="stop", scale=1)
+                example_dropdown = gr.Dropdown(
+                    list(TXT2IMG_PROMPTS.keys()),
+                    value="Portrait",
+                    label="Presets de Estilo",
+                    scale=3,
+                )
+                apply_example_btn = gr.Button("Usar Preset", variant="secondary", scale=1)
 
-        with gr.Column(scale=2):
-            img = gr.Image(label="Result", interactive=False, type="filepath")
-            timer_display = gr.Markdown("Generation Time: **0s**")
-            gallery = gr.Gallery(label="Recent Outputs", value=get_recent_outputs(), columns=3, height=260)
-            refresh_gallery_btn = gr.Button("Refresh Gallery", variant="secondary")
-            command_box = gr.Textbox(label="Last Command", interactive=False, lines=3)
-            queue_table = gr.Dataframe(
-                headers=["#", "Mode", "Prompt", "Seed", "Status"],
-                value=queue_table_rows(),
-                datatype=["number", "str", "str", "number", "str"],
-                interactive=False,
-                label="Generation Queue",
-                row_count=(4, "dynamic"),
-                column_count=(5, "fixed"),
-            )
-            clear_queue_btn = gr.Button("Clear Finished Queue Items", variant="secondary")
-            status = gr.Textbox(label="Status / Logs", interactive=False, lines=14)
+            # Conditional Image Inputs Container
+            with gr.Group(visible=False) as img2img_group:
+                init_image = gr.Image(label="Imagem de Origem (Img2Img)", type="filepath", interactive=True)
+                img2img_strength = gr.Slider(0.1, 1.0, value=0.55, step=0.05, label="Força da Alteração (Strength)")
+
+            with gr.Group(visible=False) as inpaint_group:
+                inpaint_editor = gr.ImageEditor(
+                    label="Editor de Máscara (Pinte a área a ser editada)",
+                    type="pil",
+                    image_mode="RGBA",
+                    brush=Brush(default_size=32, colors=["#ffffff"], default_color="#ffffff", color_mode="fixed"),
+                    eraser=Eraser(default_size=32),
+                    layers=True,
+                    interactive=True,
+                    height=320,
+                )
+                inpaint_strength = gr.Slider(0.1, 1.0, value=0.75, step=0.05, label="Força do Inpaint")
+
+            # Generation Settings Row
+            with gr.Row():
+                preset = gr.Dropdown([n for n, _, _ in RES_PRESETS], value="1:1 (512x512)", label="Resolução")
+                width = gr.Dropdown(SIZE_OPTIONS, value=512, label="Largura")
+                height = gr.Dropdown(SIZE_OPTIONS, value=512, label="Altura")
+                steps = gr.Slider(1, 30, value=4, step=1, label="Passos (Steps)")
+                cfg_scale = gr.Slider(0.0, 10.0, value=1.0, step=0.1, label="CFG Scale")
+
+            with gr.Row():
+                seed = gr.Number(value=-1, precision=0, label="Seed (-1 = aleatório)")
+                batch_count = gr.Slider(1, 16, value=1, step=1, label="Quantidade de Imagens")
+                random_seed_btn = gr.Button("🎲 Nova Seed", variant="secondary", size="sm")
+                reuse_seed_btn = gr.Button("🔄 Reutilizar Seed", variant="secondary", size="sm")
+
+            # Accordion: Extreme Performance & Low VRAM
+            with gr.Accordion("⚡ Otimizações Extremas & Low VRAM", open=False):
+                with gr.Row():
+                    vram_mode = gr.Radio(VRAM_PRESETS, value="4GB (safest)", label="Preset de VRAM")
+                    enable_dit_cache = gr.Checkbox(value=True, label="Ativar DiT Cache (easycache +35% FPS)")
+                with gr.Row():
+                    clip_on_cpu = gr.Checkbox(value=False, label="Text Encoder na RAM (4GB Extra)")
+                    balanced_vae_tiling = gr.Checkbox(value=True, label="VAE Tiling")
+                    cpu_threads = gr.Slider(1, os.cpu_count() or 16, value=os.cpu_count() or 4, step=1, label="Threads da CPU")
+
+            # Accordion: LoRA Models
+            with gr.Accordion("🎨 Modelos LoRA", open=False):
+                with gr.Row():
+                    lora_list = gr.CheckboxGroup(choices=get_lora_list(), label="LoRAs Selecionados")
+                    refresh_loras_btn = gr.Button("Atualizar LoRAs", variant="secondary", size="sm")
+                with gr.Row():
+                    lora_strength = gr.Slider(0.0, 2.0, value=1.0, step=0.1, label="Força do LoRA")
+                    lora_apply_mode = gr.Dropdown(LORA_APPLY_MODES, value="auto", label="Modo de Aplicação")
+
+            # Accordion: Advanced Options
+            with gr.Accordion("⚙️ Caminhos Avançados", open=False):
+                unlock = gr.Checkbox(value=False, label="Editar caminhos dos modelos")
+                vae_path = gr.Textbox(label="Caminho VAE", value=DEFAULT_VAE_PATH, interactive=False)
+                llm_path = gr.Textbox(label="Caminho LLM (Qwen)", value=DEFAULT_LLM_PATH, interactive=False)
+
+            # Action Buttons
+            with gr.Row():
+                btn = gr.Button("⚡ GERAR IMAGEM", variant="primary", scale=3)
+                stop_btn = gr.Button("🛑 PARAR", variant="stop", scale=1)
+
+        # RIGHT COLUMN (Outputs & Recent Gallery Dashboard)
+        with gr.Column(scale=4):
+            img = gr.Image(label="Resultado da Geração", interactive=False, type="filepath", height=340)
+            with gr.Row():
+                upscale_2x_btn = gr.Button("🔍 Upscale 2x HD", variant="secondary")
+                refresh_gallery_btn = gr.Button("🖼️ Atualizar Galeria", variant="secondary")
+            timer_display = gr.Markdown("Tempo de Geração: **0s**")
+
+            with gr.Accordion("🖼️ Galeria de Arquivos Recentes", open=True):
+                gallery = gr.Gallery(value=get_recent_outputs(), columns=4, height=180)
+
+            with gr.Accordion("📋 Status & Fila de Execução", open=False):
+                command_box = gr.Textbox(label="Último Comando Executado", interactive=False, lines=2)
+                queue_table = gr.Dataframe(
+                    headers=["#", "Modo", "Prompt", "Seed", "Status"],
+                    value=queue_table_rows(),
+                    datatype=["number", "str", "str", "number", "str"],
+                    interactive=False,
+                    label="Fila de Geração",
+                    row_count=(3, "dynamic"),
+                    column_count=(5, "fixed"),
+                )
+                clear_queue_btn = gr.Button("Limpar Fila Concluída", variant="secondary", size="sm")
+                status = gr.Textbox(label="Logs de Status", interactive=False, lines=6)
+
+    # Dynamic visibility switching logic
+    def toggle_mode_views(selected_mode):
+        show_img2img = selected_mode == "Image-to-Image"
+        show_inpaint = selected_mode == "Inpaint"
+        return (
+            gr.update(visible=show_img2img),
+            gr.update(visible=show_inpaint),
+        )
+
+    gen_mode.change(
+        toggle_mode_views,
+        inputs=[gen_mode],
+        outputs=[img2img_group, inpaint_group],
+    )
+
+    def apply_selected_example(style_key):
+        return TXT2IMG_PROMPTS.get(style_key, "")
 
     preset.change(apply_preset, inputs=[preset], outputs=[width, height])
-    refresh_btn.click(refresh_loras, outputs=[lora_list])
-    txt2img_example_btn.click(apply_txt2img_example, inputs=[txt2img_example], outputs=[txt2img_prompt])
-    img2img_example_btn.click(apply_img2img_example, inputs=[img2img_example], outputs=[img2img_prompt])
-    inpaint_example_btn.click(apply_inpaint_example, inputs=[inpaint_example], outputs=[inpaint_prompt])
+    apply_example_btn.click(apply_selected_example, inputs=[example_dropdown], outputs=[prompt])
     random_seed_btn.click(random_seed, outputs=[seed])
     reuse_seed_btn.click(reuse_last_seed, outputs=[seed])
-    img2img_random_seed_btn.click(random_seed, outputs=[img2img_seed])
-    img2img_reuse_seed_btn.click(reuse_last_img2img_seed, outputs=[img2img_seed])
-    inpaint_random_seed_btn.click(random_seed, outputs=[inpaint_seed])
-    inpaint_reuse_seed_btn.click(reuse_last_inpaint_seed, outputs=[inpaint_seed])
+    refresh_loras_btn.click(refresh_loras, outputs=[lora_list])
     refresh_gallery_btn.click(refresh_gallery, outputs=[gallery])
+    upscale_2x_btn.click(upscale_image, inputs=[img], outputs=[img, status])
     unlock.change(set_unlocked, inputs=[unlock], outputs=[vae_path, llm_path])
-    img2img_enabled.change(set_img2img_enabled, inputs=[img2img_enabled], outputs=[init_image, img2img_strength])
-    img2img_preset.change(apply_preset, inputs=[img2img_preset], outputs=[img2img_width, img2img_height])
-    init_image.change(
-        sync_img2img_size,
-        inputs=[init_image, img2img_auto_size, img2img_width, img2img_height],
-        outputs=[img2img_preset, img2img_width, img2img_height],
-        queue=False,
-        show_progress="hidden",
-    )
-    img2img_auto_size.change(
-        sync_img2img_size,
-        inputs=[init_image, img2img_auto_size, img2img_width, img2img_height],
-        outputs=[img2img_preset, img2img_width, img2img_height],
-        queue=False,
-        show_progress="hidden",
-    )
-    inpaint_enabled.change(set_inpaint_enabled, inputs=[inpaint_enabled], outputs=[inpaint_editor, inpaint_strength])
+
     state_outputs = [queue_table, img, status, timer_display, command_box, gallery]
     demo.load(poll_ui_state, outputs=state_outputs, queue=False, show_progress="hidden")
     queue_refresh_timer.tick(poll_ui_state, outputs=state_outputs, queue=False, show_progress="hidden")
 
-    def add_generation_job(
-        txt_prompt,
-        image_prompt,
-        selective_prompt,
-        w,
-        h,
-        st,
-        txt_seed,
-        cfg,
-        vae,
-        llm,
-        l_list,
-        l_str,
-        l_apply_mode,
-        low_vram_mode,
-        keep_clip_cpu,
-        use_balanced_vae_tiling,
-        use_img2img,
-        input_image,
-        image_width,
-        image_height,
-        image_negative_prompt,
-        image_seed,
-        image_steps,
-        image_guidance,
-        image_strength,
-        use_inpaint,
-        inpaint_image,
-        selective_negative_prompt,
-        selective_seed,
-        selective_steps,
-        selective_guidance,
-        selective_strength,
+    def submit_unified_job(
+        selected_mode,
+        user_prompt,
+        user_width,
+        user_height,
+        user_steps,
+        user_cfg,
+        user_seed,
+        batch_cnt,
+        vram_preset,
+        use_dit_cache,
+        clip_cpu,
+        vae_tiling,
+        threads_count,
+        selected_lora_list,
+        lora_str,
+        lora_mode,
+        vae_p,
+        llm_p,
+        input_img_path,
+        img2img_str,
+        inpaint_editor_val,
+        inpaint_str,
     ):
-        generation_mode = "inpaint" if use_inpaint else "img2img" if use_img2img else "txt2img"
-        if generation_mode == "inpaint":
-            run_seed = normalize_seed(selective_seed)
-            active_prompt = selective_prompt
-        elif generation_mode == "img2img":
-            run_seed = normalize_seed(image_seed)
-            active_prompt = image_prompt
+        if selected_mode == "Inpaint":
+            mode_code = "inpaint"
+        elif selected_mode == "Image-to-Image":
+            mode_code = "img2img"
         else:
-            run_seed = normalize_seed(txt_seed)
-            active_prompt = txt_prompt
+            mode_code = "txt2img"
 
-        if generation_mode == "img2img":
-            job_width = safe_int(image_width, safe_int(w, 512))
-            job_height = safe_int(image_height, safe_int(h, 512))
-        else:
-            job_width = safe_int(w, 512)
-            job_height = safe_int(h, 512)
+        num_images = max(1, safe_int(batch_cnt, 1))
 
-        job = {
-            "id": uuid.uuid4().hex,
-            "mode": generation_mode,
-            "status": "queued",
-            "prompt": active_prompt,
-            "txt_prompt": txt_prompt,
-            "image_prompt": image_prompt,
-            "selective_prompt": selective_prompt,
-            "width": job_width,
-            "height": job_height,
-            "steps": safe_int(st, 8),
-            "txt_seed": txt_seed,
-            "image_seed": image_seed,
-            "selective_seed": selective_seed,
-            "seed": run_seed,
-            "cfg_scale": safe_float(cfg, 1.0),
-            "vae_path": vae,
-            "llm_path": llm,
-            "selected_loras": list(l_list or []),
-            "lora_strength": safe_float(l_str, 1.0),
-            "lora_apply_mode": l_apply_mode,
-            "vram_mode": low_vram_mode,
-            "clip_on_cpu": bool(keep_clip_cpu),
-            "balanced_vae_tiling": bool(use_balanced_vae_tiling),
-            "input_image": input_image,
-            "image_negative_prompt": image_negative_prompt,
-            "image_steps": safe_int(image_steps, 12),
-            "image_guidance": safe_float(image_guidance, 3.5),
-            "image_strength": safe_float(image_strength, 0.55),
-            "inpaint_image": inpaint_image,
-            "selective_negative_prompt": selective_negative_prompt,
-            "selective_steps": safe_int(selective_steps, 12),
-            "selective_guidance": safe_float(selective_guidance, 4.0),
-            "selective_strength": safe_float(selective_strength, 0.75),
-        }
+        prep_init = None
+        prep_mask = None
+
+        if mode_code == "img2img":
+            if not input_img_path:
+                return queue_table_rows(), "Erro: Selecione uma imagem para o modo Img2Img."
+            prep_init, err = prepare_init_image(input_img_path, safe_int(user_width, 512), safe_int(user_height, 512))
+            if err:
+                return queue_table_rows(), err
+        elif mode_code == "inpaint":
+            if not inpaint_editor_val:
+                return queue_table_rows(), "Erro: Pinte uma área na imagem para o modo Inpaint."
+            prep_init, prep_mask, err = prepare_inpaint_images(inpaint_editor_val, safe_int(user_width, 512), safe_int(user_height, 512))
+            if err:
+                return queue_table_rows(), err
+
+        new_jobs = []
+        try:
+            base_seed = int(user_seed)
+        except (TypeError, ValueError):
+            base_seed = -1
+
+        for i in range(num_images):
+            run_seed = random_seed() if base_seed < 0 else base_seed + i
+            job = {
+                "id": uuid.uuid4().hex,
+                "mode": mode_code,
+                "status": "queued",
+                "prompt": user_prompt,
+                "txt_prompt": user_prompt,
+                "image_prompt": user_prompt,
+                "selective_prompt": user_prompt,
+                "width": safe_int(user_width, 512),
+                "height": safe_int(user_height, 512),
+                "steps": safe_int(user_steps, 4),
+                "txt_seed": user_seed,
+                "image_seed": user_seed,
+                "selective_seed": user_seed,
+                "seed": run_seed,
+                "cfg_scale": safe_float(user_cfg, 1.0),
+                "vae_path": vae_p,
+                "llm_path": llm_p,
+                "selected_loras": list(selected_lora_list or []),
+                "lora_strength": safe_float(lora_str, 1.0),
+                "lora_apply_mode": lora_mode,
+                "vram_mode": vram_preset,
+                "clip_on_cpu": bool(clip_cpu),
+                "balanced_vae_tiling": bool(vae_tiling),
+                "cpu_threads": safe_int(threads_count, -1),
+                "enable_dit_cache": bool(use_dit_cache),
+                "input_image": prep_init,
+                "image_negative_prompt": "",
+                "image_steps": safe_int(user_steps, 4),
+                "image_guidance": 3.5,
+                "image_strength": safe_float(img2img_str, 0.55) if mode_code == "img2img" else safe_float(inpaint_str, 0.75),
+                "inpaint_image": prep_init,
+                "inpaint_mask": prep_mask,
+                "selective_negative_prompt": "",
+                "selective_steps": safe_int(user_steps, 4),
+                "selective_guidance": 4.0,
+                "selective_strength": safe_float(inpaint_str, 0.75),
+            }
+            new_jobs.append(job)
+
         with generation_lock:
-            generation_jobs.append(job)
+            generation_jobs.extend(new_jobs)
             queued_count = sum(1 for item in generation_jobs if item["status"] == "queued")
             running_count = sum(1 for item in generation_jobs if item["status"] == "running")
-        message = (
-            f"Added to queue: {generation_mode}. "
-            f"Running: {running_count} | Waiting: {queued_count}"
-        )
+
+        msg = f"Adicionado(s) {len(new_jobs)} job(s) à fila ({mode_code}). Executando: {running_count} | Aguardando: {queued_count}"
         ensure_generation_worker()
-        return queue_table_rows(), message
+        return queue_table_rows(), msg
 
     btn.click(
-        add_generation_job,
+        submit_unified_job,
         inputs=[
-            txt2img_prompt,
-            img2img_prompt,
-            inpaint_prompt,
+            gen_mode,
+            prompt,
             width,
             height,
             steps,
-            seed,
             cfg_scale,
-            vae_path,
-            llm_path,
+            seed,
+            batch_count,
+            vram_mode,
+            enable_dit_cache,
+            clip_on_cpu,
+            balanced_vae_tiling,
+            cpu_threads,
             lora_list,
             lora_strength,
             lora_apply_mode,
-            vram_mode,
-            clip_on_cpu,
-            balanced_vae_tiling,
-            img2img_enabled,
+            vae_path,
+            llm_path,
             init_image,
-            img2img_width,
-            img2img_height,
-            img2img_negative_prompt,
-            img2img_seed,
-            img2img_steps,
-            img2img_guidance,
             img2img_strength,
-            inpaint_enabled,
             inpaint_editor,
-            inpaint_negative_prompt,
-            inpaint_seed,
-            inpaint_steps,
-            inpaint_guidance,
             inpaint_strength,
         ],
         outputs=[queue_table, status],
@@ -1150,3 +1149,5 @@ if __name__ == "__main__":
         share=False,
         quiet=os.environ.get("ZIMAGE_QUIET_LAUNCH") == "1",
     )
+
+

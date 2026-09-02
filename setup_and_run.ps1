@@ -185,24 +185,34 @@ function Detect-Hardware {
 
     $adapters = @(Get-DisplayAdapters)
     $adapterText = ($adapters | ForEach-Object { $_.Name }) -join "; "
+    $firstAdapter = $adapters | Select-Object -First 1
+    $adapterVramMb = 0
+    if ($firstAdapter -and $firstAdapter.AdapterRAM) {
+        try {
+            $adapterVramMb = [int]($firstAdapter.AdapterRAM / 1MB)
+        } catch {
+            $adapterVramMb = 0
+        }
+    }
+
     if ($adapterText -match "AMD|Radeon") {
         return [pscustomobject]@{
             Vendor = "AMD"
             Name = $adapterText
-            VramMb = 0
+            VramMb = $adapterVramMb
             ComputeCapability = ""
             CudaAvailable = $false
-            BackendKind = "cpu"
+            BackendKind = "vulkan"
         }
     }
     if ($adapterText -match "Intel|Arc") {
         return [pscustomobject]@{
             Vendor = "Intel"
             Name = $adapterText
-            VramMb = 0
+            VramMb = $adapterVramMb
             ComputeCapability = ""
             CudaAvailable = $false
-            BackendKind = "cpu"
+            BackendKind = "vulkan"
         }
     }
     return [pscustomobject]@{
@@ -214,6 +224,7 @@ function Detect-Hardware {
         BackendKind = "cpu"
     }
 }
+
 
 function Recommend-Profile {
     param([object]$Hardware)
@@ -319,15 +330,24 @@ function Copy-BackendFiles {
 function Install-BackendAutomatically {
     param([string]$BackendKind)
     Write-Host ""
-    Write-Host "Installing stable-diffusion.cpp backend automatically..."
+    Write-Host "Installing stable-diffusion.cpp backend automatically ($BackendKind)..."
     $release = Get-LatestRelease
     if ($BackendKind -eq "cuda12") {
-        $cudaDir = Download-And-Extract-Asset -Release $release -NamePattern "sd-*-bin-win-cuda12-x64.zip" -Label "Downloading CUDA backend"
+        $cudaDir = Download-And-Extract-Asset -Release $release -NamePattern "sd-*-bin-win-cuda12-x64.zip" -Label "Downloading CUDA 12 backend"
         Copy-BackendFiles -ExtractDir $cudaDir
         $runtimeDir = Download-And-Extract-Asset -Release $release -NamePattern "cudart-sd-bin-win-cu12-x64.zip" -Label "Downloading CUDA runtime DLLs"
         Copy-BackendFiles -ExtractDir $runtimeDir
+    } elseif ($BackendKind -eq "vulkan") {
+        try {
+            $vulkanDir = Download-And-Extract-Asset -Release $release -NamePattern "sd-*-bin-win-vulkan-x64.zip" -Label "Downloading Vulkan GPU backend"
+            Copy-BackendFiles -ExtractDir $vulkanDir
+        } catch {
+            Write-Host "Vulkan package not found in release, falling back to AVX2 CPU backend..."
+            $cpuDir = Download-And-Extract-Asset -Release $release -NamePattern "sd-*-bin-win-avx2-x64.zip" -Label "Downloading CPU (AVX2) backend"
+            Copy-BackendFiles -ExtractDir $cpuDir
+        }
     } else {
-        $cpuDir = Download-And-Extract-Asset -Release $release -NamePattern "sd-*-bin-win-avx2-x64.zip" -Label "Downloading CPU backend"
+        $cpuDir = Download-And-Extract-Asset -Release $release -NamePattern "sd-*-bin-win-avx2-x64.zip" -Label "Downloading CPU (AVX2) backend"
         Copy-BackendFiles -ExtractDir $cpuDir
     }
 }
@@ -503,6 +523,7 @@ function Run-SetupWizard {
             vram_mb = $hardware.VramMb
             compute_capability = $hardware.ComputeCapability
             cuda_available = $hardware.CudaAvailable
+            cpu_threads = [Environment]::ProcessorCount
         }
         preferences = [ordered]@{
             launch_url = "http://127.0.0.1:9000"

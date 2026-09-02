@@ -45,6 +45,15 @@
       "sha256": "",
       "recommended_profile": "all",
       "approx_size_gb": 2.4
+    },
+    "qwen-text-encoder-q3": {
+      "display_name": "Qwen Text Encoder Q3_K_M (Ultra Light)",
+      "type": "llm",
+      "filename": "Qwen3-4B-Instruct-2507-Q3_K_M.gguf",
+      "url": "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q3_K_M.gguf",
+      "sha256": "",
+      "recommended_profile": "ultra_low_vram",
+      "approx_size_gb": 1.6
     }
   },
   "profiles": {
